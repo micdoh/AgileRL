@@ -15,8 +15,9 @@ import torch
 import yaml
 from datasets import Dataset
 from peft import LoraConfig
+from accelerate import Accelerator
 
-USE_SEPARATE_CRITIC = True  # Set False to use ppo_llm_2.py (single actor with shared adapters)
+USE_SEPARATE_CRITIC = False  # Set False to use ppo_llm_2.py (single actor with shared adapters)
 
 if USE_SEPARATE_CRITIC:
     from agilerl.algorithms.ppo_llm import PPO as LLMPPO
@@ -131,6 +132,7 @@ def enable_reinforce_style_advantages(agent: LLMPPO) -> None:
 
 
 def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
+    accelerator = Accelerator()
     torch.manual_seed(seed)
     actor_network = build_tiny_actor_network()
     critic_network = build_tiny_critic_network() if USE_SEPARATE_CRITIC else None
@@ -150,7 +152,7 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
         reward_fn=conditional_reward,
         conversation_template=conversation_template,
         data_batch_size_per_gpu=init_hp["BATCH_SIZE"],
-        accelerator=None,
+        accelerator=accelerator,
         max_context_length=MAX_CONTEXT_LENGTH,
         return_raw_completions=False,
         seed=seed,
@@ -183,7 +185,7 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
         temperature=init_hp["TEMPERATURE"],
         max_output_tokens=MAX_OUTPUT_TOKENS,
         max_model_len=MAX_CONTEXT_LENGTH,
-        accelerator=None,
+        accelerator=accelerator,
         vf_coef=init_hp["VF_COEF"],
         gamma=init_hp["GAMMA"],
         gae_lambda=init_hp["GAE_LAMBDA"],
@@ -220,7 +222,7 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
             evo_steps=None,
             mutation=None,
             tournament=None,
-            accelerator=None,
+            accelerator=accelerator,
             checkpoint_steps=999999,
             verbose=True,
             max_steps=4096,
