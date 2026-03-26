@@ -14,14 +14,21 @@ from datasets import Dataset
 from peft import LoraConfig
 import torch
 from accelerate import Accelerator
-from agilerl.algorithms import LLMPPO
+
+USE_SEPARATE_CRITIC = False  # Set False to use ppo_llm_2.py (single actor with shared adapters)
+
+if USE_SEPARATE_CRITIC:
+    from agilerl.algorithms.ppo_llm import PPO as LLMPPO
+else:
+    from agilerl.algorithms.ppo_llm_2 import PPO as LLMPPO
 from agilerl.training import train_llm
 from agilerl.training.train_llm import finetune_llm_reasoning
 from agilerl.utils.llm_utils import ReasoningGym
 from benchmarking.tiny_model import (
     build_tiny_actor_network,
+    build_tiny_critic_network,
     TinyDigitTokenizer,
-)
+)  # build_tiny_critic_network used only when USE_SEPARATE_CRITIC=True
 
 MAX_CONTEXT_LENGTH = 128
 MAX_OUTPUT_TOKENS = 1
@@ -90,9 +97,10 @@ def evaluate_target_token_rate_greedy_like(
 
 
 def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
-    accelerator = Accelerator()
+    accelerator = None # Accelerator()
     torch.manual_seed(seed)
     actor_network = build_tiny_actor_network()
+    critic_network = build_tiny_critic_network() if USE_SEPARATE_CRITIC else None
     tokenizer = TinyDigitTokenizer()
     if TARGET_TOKEN_ID in (tokenizer.pad_token_id, tokenizer.eos_token_id):
         msg = (
@@ -124,6 +132,7 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
     llm_ppo = LLMPPO(
         model_name=None,
         actor_network=actor_network,
+        **({"critic_network": critic_network} if USE_SEPARATE_CRITIC else {}),
         lora_config=LoraConfig(
             r=8,
             lora_alpha=16,
@@ -217,9 +226,9 @@ if __name__ == "__main__":
     init_hp["BATCH_SIZE"] = 32
     init_hp["UPDATE_EPOCHS"] = 2
     init_hp["LR"] = 1e-3
-    init_hp["BETA"] = 0.0
+    init_hp["BETA"] = 0.01
     init_hp["TEMPERATURE"] = 0.8
-    init_hp["VF_COEF"] = 0.0
+    init_hp["VF_COEF"] = 0.5
     init_hp["GAMMA"] = 1.0
     init_hp["GAE_LAMBDA"] = 1.0
     main(init_hp)

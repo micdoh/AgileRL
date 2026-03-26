@@ -113,7 +113,7 @@ def main(init_hp, mut_p):
         actor_network = None
         model_name = MODEL_PATH
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-        target_modules = ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"]
+        target_modules = ["q_proj","k_proj","v_proj","o_proj","up_proj"]
 
     # tokenizer.pad_token = tokenizer.eos_token
     print("Tokenizer", tokenizer.pad_token, tokenizer.eos_token)
@@ -133,7 +133,7 @@ def main(init_hp, mut_p):
     ]
 
     # Convert the HuggingFace dataset into a Gymnasium environment
-    accelerator = Accelerator() if not USE_TINY_DEBUG_MODEL else None
+    accelerator = None # Accelerator() if not USE_TINY_DEBUG_MODEL else None
     env = ReasoningGym(
         train_dataset=train_dataset,
         test_dataset=test_dataset,
@@ -184,6 +184,7 @@ def main(init_hp, mut_p):
         vf_coef=init_hp["VF_COEF"],
         gamma=init_hp["GAMMA"],
         gae_lambda=init_hp["GAE_LAMBDA"],
+        calc_position_embeddings=False,
         vllm_config=VLLMConfig(
             tensor_parallel_size=1,
             gpu_memory_utilization=0.5,

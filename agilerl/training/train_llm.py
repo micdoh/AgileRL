@@ -158,14 +158,15 @@ def finetune_llm_reasoning(
             "Probability of activation mutation must be 0 for LLM finetuning."
         )
 
-    if not isinstance(pop[0], (GRPO, LLMPPO)):
-        msg = (
-            "The algorithm must be GRPO or LLMPPO for reasoning-based reinforcement learning."
-            f"Got {type(pop[0])} instead."
-        )
-        raise ValueError(
-            msg,
-        )
+    # FIXME
+    # if not isinstance(pop[0], (GRPO, LLMPPO)):
+    #     msg = (
+    #         "The algorithm must be GRPO or LLMPPO for reasoning-based reinforcement learning."
+    #         f"Got {type(pop[0])} instead."
+    #     )
+    #     raise ValueError(
+    #         msg,
+    #     )
 
     if init_hp is None:
         init_hp = {}

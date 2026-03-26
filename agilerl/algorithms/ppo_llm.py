@@ -1,3 +1,4 @@
+import dataclasses
 import gc
 from pathlib import Path
 import token
@@ -7,11 +8,13 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
+from torch.nn.utils import clip_grad_norm_
 from torchviz import make_dot
 
 from agilerl import HAS_LLM_DEPENDENCIES
 from agilerl.algorithms.core import LLMAlgorithm, OptimizerWrapper
 from agilerl.algorithms.core.registry import HyperparameterConfig, NetworkGroup
+from agilerl.modules.dummy import DummyEvolvable
 from agilerl.protocols import (
     LoraConfigProtocol,
     PeftModelProtocol,
@@ -26,7 +29,12 @@ from agilerl.utils.algo_utils import (
     get_experiences_samples,
     stack_and_pad_experiences,
 )
-from agilerl.utils.llm_utils import ReasoningGym, masked_whiten, masked_mean
+from agilerl.utils.llm_utils import (
+    ReasoningGym,
+    create_model_from_name_or_path,
+    masked_mean,
+    masked_whiten,
+)
 
 if HAS_LLM_DEPENDENCIES:
     from transformers import GenerationConfig
@@ -90,6 +98,7 @@ class PPO(LLMAlgorithm):
         pad_token: str,
         model_name: str | None = None,
         actor_network: Any | None = None,
+        critic_network: Any | None = None,
         model_config: dict[str, Any] | None = None,
         hp_config: HyperparameterConfig | None = None,
         index: int = 0,
@@ -142,9 +151,7 @@ class PPO(LLMAlgorithm):
             seed=seed,
             pad_token_id=pad_token_id,
             pad_token=pad_token,
-            # Keep the standard PyTorch PPO path for now because value-head
-            # training requires explicit hidden-state/value computation.
-            use_value_head=True,
+            use_value_head=False,
             use_liger_loss=False,
             lora_config=lora_config,
             use_separate_reference_adapter=use_separate_reference_adapter,
@@ -217,14 +224,12 @@ class PPO(LLMAlgorithm):
         if self.use_vllm:
             self._configure_vllm()
         self._initialize_actors(actor_network, not clone)
+        self._initialize_critic(critic_network, not clone)
         # Register network groups for mutations
         self.register_network_group(NetworkGroup(eval_network=self.actor, policy=True))
+        self.register_network_group(NetworkGroup(eval_network=self.critic))
         if self.wrap:
             self.wrap_models()
-
-        print("Actor: ", self.actor)
-        # print_zero2_bucket_layout(self.actor)
-        # assert False
 
     def get_action(
         self,
@@ -276,6 +281,90 @@ class PPO(LLMAlgorithm):
 
         return completion_ids, action_masks
 
+    def _initialize_critic(
+        self,
+        critic_network: Any | None = None,
+        add_adapter: bool = True,
+    ) -> None:
+        """Initialize the separate critic network (AutoModelForCausalLMWithValueHead + LoRA).
+
+        The critic shares the same pretrained backbone as the actor but is a
+        fully independent model instance whose LoRA params are registered as a
+        second param group in the shared actor optimizer so that a single
+        combined backward pass updates both networks together.
+        The critic LoRA config mirrors the actor's but additionally targets the
+        value-head "summary" layer.
+        """
+        if HAS_LLM_DEPENDENCIES:
+            from peft import get_peft_model
+
+        if critic_network is None:
+            critic_base = create_model_from_name_or_path(
+                self.pretrained_model_name_or_path,
+                model_config=self.model_config,
+                add_value_head=True,
+            )
+        else:
+            critic_base = critic_network
+
+        if add_adapter and HAS_LLM_DEPENDENCIES:
+            critic_lora_config = dataclasses.replace(self.lora_config)
+            target = set(critic_lora_config.target_modules) if critic_lora_config.target_modules else set()
+            target.add("summary")
+            critic_lora_config.target_modules = target
+            self.critic = get_peft_model(critic_base, critic_lora_config, adapter_name="critic")
+        else:
+            self.critic = critic_base
+
+        if self.accelerator is None:
+            self.critic = DummyEvolvable(module=self.critic, device=self.device)
+
+        # Add critic LoRA params as a second param group in the shared optimizer so
+        # a single optimizer.step() updates both actor and critic.
+        critic_lora_params = [
+            p for n, p in self.critic.named_parameters()
+            if "lora" in n and p.requires_grad
+        ]
+        self.optimizer.optimizer.add_param_group({"params": critic_lora_params, "lr": self.lr})
+
+    def wrap_models(self) -> None:
+        """Wrap actor and critic with the accelerator for distributed training."""
+        super().wrap_models()  # wraps actor + shared optimizer
+
+        if self.accelerator is not None:
+            # Critic is prepared separately for device placement; its LoRA params
+            # are already registered in the shared optimizer wrapped by super().
+            self.critic = self.accelerator.prepare(self.critic)
+            if self.gradient_checkpointing:
+                self.critic.module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+        else:
+            self.critic = self.critic.to(self.device)
+            if self.gradient_checkpointing:
+                self.critic.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+
+    def _backward_pass(self, loss: torch.Tensor) -> None:
+        """Single backward pass updating both actor and critic via the shared optimizer."""
+        if self.accelerator is not None:
+            self.accelerator.backward(loss)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        else:
+            loss.backward()
+            # Clip all trainable params across both actor and critic param groups.
+            all_lora_params = [
+                p for group in self.optimizer.optimizer.param_groups
+                for p in group["params"]
+            ]
+            clip_grad_norm_(all_lora_params, self.max_grad_norm)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+            self.lr = self.lr_scheduler.get_last_lr()[0]
 
     def learn(
         self,
@@ -317,67 +406,42 @@ class PPO(LLMAlgorithm):
 
 
         with torch.no_grad():
-            reference_log_probs = self._get_logprobs(
-                completion_ids,
-                batch_size=batch_size,
-                use_reference=True,
-                eval_mode=True,
-            )
-            old_log_probs = self._get_logprobs(
-                completion_ids,
-                batch_size=batch_size,
-                use_reference=False,
-                eval_mode=True,
-            )
-            with self.select_adapter("critic"):
-                old_values = self._get_values(
+            with self.select_adapter("reference"):
+                reference_log_probs = self._get_logprobs(
                     completion_ids,
                     batch_size=batch_size,
+                    use_reference=True,
                     eval_mode=True,
                 )
-                old_values = torch.masked_fill(old_values, ~action_masks.bool(), 0.0)
-            # old_log_probs, old_values = self._get_logprobs_and_values(
-            #     completion_ids,
-            #     batch_size=batch_size,
-            #     use_reference=False,
-            #     eval_mode=True,
-            # )
-            
+            with self.select_adapter("actor"):
+                old_log_probs = self._get_logprobs(
+                    completion_ids,
+                    batch_size=batch_size,
+                    use_reference=False,
+                    eval_mode=True,
+                )
+            old_values = self._get_values(
+                completion_ids,
+                batch_size=batch_size,
+                eval_mode=True,
+            )
+            old_values = torch.masked_fill(old_values, ~action_masks.bool(), 0.0)
 
             token_rewards = self._compute_token_rewards(action_masks, sequence_rewards)
-
-            # FIXME the below is for policy testing
-            # target_token_id = 13
-            # token_rewards = (completion_ids[:, 1:] == target_token_id) * action_masks.float() # NOTE for policy net testing
-
             old_log_probs = torch.masked_fill(old_log_probs, ~action_masks.bool(), 1.0)
             reference_log_probs = torch.masked_fill(reference_log_probs, ~action_masks.bool(), 1.0)
             token_kl = old_log_probs - reference_log_probs
-
             token_penalised_rewards = token_rewards - self.beta * token_kl
-
-
-            torch.set_printoptions(threshold=torch.inf)
-            # print(token_penalised_rewards)
-            # print(old_log_probs == reference_log_probs)
-            # assert False
             returns, advantages = self._compute_gae_returns(token_penalised_rewards, old_values, action_masks)            
 
-            torch.set_printoptions(threshold=torch.inf)
-
-            # print(old_log_probs)
-
         params = {}
-
         for name, param in self.actor.named_parameters():
-            if "lora" in name and ("actor" in name or "critic" in name):
+            if "lora" in name and "actor" in name:
                 params[name] = param.clone().detach()
-
-
-        aligned_action_masks = action_masks#:, 1:]
-        aligned_advantages = advantages#[:, :-1]
-        algined_returns = returns#[:, :-1]
-        aligned_old_values = old_values#[:, :-1]
+        critic_params = {}
+        for name, param in self.critic.named_parameters():
+            if "lora" in name and "critic" in name:
+                critic_params[name] = param.clone().detach()
 
         for _ in range(self.update_epochs):
             self.rng.shuffle(batch_idxs)
@@ -394,67 +458,42 @@ class PPO(LLMAlgorithm):
                 ) = get_experiences_samples(
                     minibatch_idxs,
                     completion_ids,
-                    aligned_action_masks,
+                    action_masks,
                     old_log_probs,
                     reference_log_probs,
-                    algined_returns,
-                    aligned_advantages,
-                    aligned_old_values,
-                )
-                # batch_log_probs, batch_values = self._get_logprobs_and_values(
-                #     batch_ids,
-                #     batch_size=batch_size,
-                #     use_reference=False,
-                #     eval_mode=False,
-                # )
-
-                # Pass 1: actor forward — builds pg_loss computation graph with actor LoRA.
-                # Restore critic trainability first: previous iteration's _use_policy()
-                # called set_adapter("actor") which PEFT side-effects to critic requires_grad=False.
-                # ZeRO-2 bucket hooks registered at prepare() time must keep firing for all adapters.
-                # self._restore_lora_trainability(["critic"])
-                batch_log_probs = self._get_logprobs(
-                    batch_ids,
-                    batch_size=batch_size,
-                    use_reference=False,
-                    eval_mode=False,
-                )
-                # _get_logprobs calls _use_policy() -> set_adapter("actor") -> disables critic again.
-                # self._restore_lora_trainability(["critic"])
-
-                batch_log_probs = torch.masked_fill(batch_log_probs, ~batch_action_mask.bool(), 1.0)
-                kl = batch_log_probs - batch_reference_log_probs
-
-                # Proxy entropy (-log pi(a_t|s_t)) avoids full-vocab entropy tensors.
-                masked_entropy = masked_mean(-batch_log_probs.detach(), batch_action_mask)
-
-                policy_ratio = torch.exp(
-                    batch_log_probs - batch_old_log_probs,
-                )
-                clipped_ratio = torch.clamp(
-                    policy_ratio,
-                    1 - self.clip_coef,
-                    1 + self.clip_coef,
+                    returns,
+                    advantages,
+                    old_values,
                 )
 
-                pg_loss_unclipped = -batch_advantages * policy_ratio
-                pg_loss_clipped = -batch_advantages * clipped_ratio
-                pg_loss = masked_mean(torch.max(pg_loss_unclipped, pg_loss_clipped), batch_action_mask)
+                with self.select_adapter("actor"):
+                    batch_log_probs = self._get_logprobs(
+                        batch_ids,
+                        batch_size=batch_size,
+                        use_reference=False,
+                        eval_mode=False,
+                    )
+                    batch_log_probs = torch.masked_fill(batch_log_probs, ~batch_action_mask.bool(), 1.0)
+                    kl = batch_log_probs - batch_reference_log_probs
+                    masked_entropy = masked_mean(-batch_log_probs.detach(), batch_action_mask)
+                    policy_ratio = torch.exp(
+                        batch_log_probs - batch_old_log_probs,
+                    )
+                    clipped_ratio = torch.clamp(
+                        policy_ratio,
+                        1 - self.clip_coef,
+                        1 + self.clip_coef,
+                    )
+                    pg_loss_unclipped = -batch_advantages * policy_ratio
+                    pg_loss_clipped = -batch_advantages * clipped_ratio
+                    pg_loss = masked_mean(torch.max(pg_loss_unclipped, pg_loss_clipped), batch_action_mask)
 
-
-                self._backward_pass(pg_loss)
-
-                # Pass 2: critic forward — builds vf_loss computation graph with critic LoRA.
-                # Switch adapter then immediately restore actor trainability (PEFT disabled it).
-                self.actor.set_adapter("critic")
-                # self._restore_lora_trainability(["actor"])
                 batch_values = self._get_values(
                     batch_ids,
                     batch_size=batch_size,
                     eval_mode=False,
                 )
                 batch_values = torch.masked_fill(batch_values, ~batch_action_mask.bool(), 0.0)
-
                 vf_loss = (batch_returns - batch_values).pow(2)
                 clipped_batch_values = batch_old_values + torch.clamp(
                     batch_values - batch_old_values,
@@ -462,37 +501,27 @@ class PPO(LLMAlgorithm):
                     self.clip_coef,
                 )
                 clipped_vf_loss = (batch_returns - clipped_batch_values).pow(2)
-                vf_loss = 0.5 * masked_mean(torch.max(vf_loss, clipped_vf_loss), batch_action_mask)
+                vf_loss = 0.5 * masked_mean(torch.max(vf_loss, clipped_vf_loss), batch_action_mask) * self.vf_coef
 
-                # Combined backward — ZeRO-2 compatible single step per minibatch.
-                # Both actor LoRA (in pg_loss graph) and critic LoRA (in vf_loss graph)
-                # have requires_grad=True so all ZeRO-2 gradient bucket hooks fire.
-                # Gradient isolation is via computation graph structure, not requires_grad.
-                # total_loss = pg_loss + self.vf_coef * vf_loss # 1774514395.905044
-
-                # if not total_loss.isfinite():
-                #     raise ValueError(f"Loss is not finite: {total_loss}")
-
-                # self._restore_lora_trainability(["actor", "critic"])
-                self._backward_pass(vf_loss)
-
-                # Restore actor adapter for next iteration; keep critic trainable.
-                self._use_policy()
-                # self._restore_lora_trainability(["critic"])
+                total_loss = pg_loss + vf_loss
+                self._backward_pass(total_loss)
 
                 mean_kl += masked_mean(kl, batch_action_mask).item()
                 mean_entropy += masked_entropy.mean().item()
                 del masked_entropy
                 mean_pg_loss += pg_loss.mean().item()
                 mean_vf_loss += vf_loss.mean().item()
-                # mean_loss += total_loss.item()
+                mean_loss += total_loss.item()
                 updates += 1
 
         for name, param in self.actor.named_parameters():
-            # Check loras have updated
-            if "lora" in name and ("actor" in name or "critic" in name):
+            if "lora" in name and "actor" in name:
                 if torch.equal(param.data, params[name].data):
-                    print(f"Lora {name} has not updated {time.time()}")
+                    print(f"Actor lora {name} has not updated {self.learn_ticker}")
+        for name, param in self.critic.named_parameters():
+            if "lora" in name and "critic" in name:
+                if torch.equal(param.data, critic_params[name].data):
+                    print(f"Critic lora {name} has not updated {self.learn_ticker}")
                     
 
 
@@ -561,11 +590,21 @@ class PPO(LLMAlgorithm):
             delta = rewards[:, t] + self.gamma * next_values - values[:, t]
             last_gae = (delta + self.gamma * self.gae_lambda * last_gae) * mask_t
             advantages[:, t] = last_gae
-
+        
+        # print("Calculated advantages")
+        # print(advantages[0])
 
         returns = advantages + values
-
+        # print("Calculated returns")
+        # print(returns[0])
+        
+        # # Comment out the whitening for now
         advantages = masked_whiten(advantages, action_mask)
+        # print("Whiten advantages")
+        # print(advantages[0])
+
+        # print(advantages)
+        # print(returns)
 
         return returns, advantages * action_mask
             
@@ -606,8 +645,7 @@ class PPO(LLMAlgorithm):
         eval_mode: bool = False,
         attention_mask: torch.Tensor | None = None,
     ):
-        # with self.select_adapter("critic"):
-        self.actor.train(mode=not eval_mode)
+        self.critic.train(mode=not eval_mode)
         num_samples = ids.shape[0]
         if attention_mask is None:
             attention_mask = ids != self.pad_token_id
@@ -628,9 +666,8 @@ class PPO(LLMAlgorithm):
             if self.calc_position_embeddings:
                 batch_position_ids = position_ids[batch:end_idx, :]
                 batch_model_kwargs |= {"position_ids": batch_position_ids}
-            *_, value = self.actor.forward(**batch_model_kwargs)
-            
-            values.append(value[:, 1:])
+            *_, value = self.critic.forward(**batch_model_kwargs)
+            values.append(value[:, :-1])
         return torch.cat(values, dim=0)
                 
         

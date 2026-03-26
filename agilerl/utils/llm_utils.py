@@ -697,10 +697,14 @@ def create_model_from_name_or_path(
         }
     print("model_config", model_config)
     if add_value_head:
-        return AutoModelForCausalLMWithValueHead.from_pretrained(
+        model = AutoModelForCausalLMWithValueHead.from_pretrained(
             pretrained_model_name_or_path=model_name_or_path,
             **model_config,
         )
+        # AutoModelForCausalLMWithValueHead doesn't expose generation_config,
+        # which PEFT's generate() expects on the base model.
+        model.generation_config = model.pretrained_model.generation_config
+        return model
     return AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=model_name_or_path,
         **model_config,

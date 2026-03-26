@@ -23,6 +23,7 @@ import dill
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list, set_seed
 from gymnasium import spaces
@@ -1993,9 +1994,11 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             self.pretrained_model_name_or_path = model_name
         elif hasattr(actor_network, "name_or_path"):
             self.pretrained_model_name_or_path = actor_network.name_or_path
-        elif hasattr(actor_network.base_model, "name_or_path"):
+        elif hasattr(actor_network, "pretrained_model") and hasattr(actor_network.pretrained_model, "name_or_path"):
+            self.pretrained_model_name_or_path = actor_network.pretrained_model.name_or_path
+        elif hasattr(actor_network, "base_model") and hasattr(actor_network.base_model, "name_or_path"):
             self.pretrained_model_name_or_path = actor_network.base_model.name_or_path
-        elif hasattr(actor_network.base_model, "pretrained_model"):
+        elif hasattr(actor_network, "base_model") and hasattr(actor_network.base_model, "pretrained_model"):
             self.pretrained_model_name_or_path = actor_network.base_model.pretrained_model.name_or_path
         else:
             raise ValueError("Actor network name or path not found.")
@@ -2299,39 +2302,12 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 "Optimizer is set to None, please check that the optimizer is correctly defined."
             )
             is_dummy_optimizer = isinstance(self.optimizer.optimizer, DummyOptimizer)
-
-            # FIXME hacky asf
-            for name, param in self.actor.named_parameters():
-                if "critic" in name and "lora" in name:
-                    param.requires_grad = True
-
-            # Check this at init time, before deepspeed.initialize()
-            optimizer = self.optimizer.optimizer
-            all_group_params = set()
-            for group in optimizer.param_groups:
-                for p in group['params']:
-                    all_group_params.add(id(p))
-
-            for name, p in self.actor.named_parameters():
-                if "actor" in name and "lora" in name:
-                    print(name, id(p) in all_group_params)
-
-            for name, p in self.actor.named_parameters():
-                if "critic" in name and "lora" in name:
-                    print(name, id(p) in all_group_params)
-
-            # assert False
                     
             self.actor, optimizer, self.lr_scheduler = self.accelerator.prepare(
                 self.actor,
                 self.optimizer.optimizer,
                 self.lr_scheduler,
             )
-
-            print(len(self.actor.optimizer.bit16_groups))  # should be 2
-            print(len(self.actor.optimizer.params_in_partition[0]))  # actor params on this rank
-            print(len(self.actor.optimizer.params_in_partition[1]))  # critic params on this rank
-            assert False
 
             self.optimizer.optimizer = (
                 optimizer if not is_dummy_optimizer else self.actor.optimizer
@@ -2351,7 +2327,9 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
             self.actor = self.actor.to(self.device)
             if self.gradient_checkpointing:
-                self.actor.gradient_checkpointing_enable()
+                self.actor.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
 
     def clean_up(self) -> None:
         """Clean up the algorithm."""
@@ -2644,13 +2622,14 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
 
         if self.use_value_head and add_adapters:
-            import dataclasses
-            config = dataclasses.replace(self.lora_config)
-            config.target_modules.add("summary")
-            self.actor.add_adapter(
-                adapter_name="critic",
-                peft_config=config,  # type: ignore[arg-type]
-            )
+            # import dataclasses
+            # config = dataclasses.replace(self.lora_config)
+            # config.target_modules.add("summary")
+            # self.actor.add_adapter(
+            #     adapter_name="critic",
+            #     peft_config=config,  # type: ignore[arg-type]
+            # )
+            pass
 
         self.actor.set_adapter("actor")
 
@@ -2706,42 +2685,41 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         :return: Log probabilities of the completion IDs.
         :rtype: torch.Tensor
         """
-        with self.select_policy(use_reference):
-            self.actor.train(mode=not eval_mode)
-            num_samples = ids.shape[0]
-            if attention_mask is None:
-                # TODO this calc is avoided when using PreferenceGym, need to make ReasoningGym do the same
-                attention_mask = ids != self.pad_token_id
+        self.actor.train(mode=not eval_mode)
+        num_samples = ids.shape[0]
+        if attention_mask is None:
+            # TODO this calc is avoided when using PreferenceGym, need to make ReasoningGym do the same
+            attention_mask = ids != self.pad_token_id
+        if self.calc_position_embeddings:
+            position_ids = attention_mask.long().cumsum(dim=-1) - 1
+            position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
+
+        # Split the sample into batches
+        log_probs = []
+        for batch in range(0, num_samples, batch_size):
+            end_idx = min((batch + batch_size), num_samples)
+            batch_ids = ids[batch:end_idx, :]
+            batch_attention_mask = attention_mask[batch:end_idx, :]
+            batch_model_kwargs = {
+                "input_ids": batch_ids,
+                "attention_mask": batch_attention_mask,
+                "use_cache": False,
+            }
             if self.calc_position_embeddings:
-                position_ids = attention_mask.long().cumsum(dim=-1) - 1
-                position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
+                batch_position_ids = position_ids[batch:end_idx, :]
+                batch_model_kwargs |= {"position_ids": batch_position_ids}
+            output = self.actor.forward(**batch_model_kwargs)
+            logits = output[0] if isinstance(output, tuple) else output.logits
+            logits = logits / self.temperature
 
-            # Split the sample into batches
-            log_probs = []
-            for batch in range(0, num_samples, batch_size):
-                end_idx = min((batch + batch_size), num_samples)
-                batch_ids = ids[batch:end_idx, :]
-                batch_attention_mask = attention_mask[batch:end_idx, :]
-                batch_model_kwargs = {
-                    "input_ids": batch_ids,
-                    "attention_mask": batch_attention_mask,
-                    "use_cache": False,
-                }
-                if self.calc_position_embeddings:
-                    batch_position_ids = position_ids[batch:end_idx, :]
-                    batch_model_kwargs |= {"position_ids": batch_position_ids}
-                output = self.actor.forward(**batch_model_kwargs)
-                logits = output[0] if isinstance(output, tuple) else output.logits
-                logits = logits / self.temperature
+            log_prob = LLMAlgorithm._memory_efficient_logits(
+                logits[:, :-1],
+                batch_ids[:, 1:],
+            )
 
-                log_prob = LLMAlgorithm._memory_efficient_logits(
-                    logits[:, :-1],
-                    batch_ids[:, 1:],
-                )
-
-                batch_model_kwargs = None
-                logits = None
-                log_probs.append(log_prob)
+            batch_model_kwargs = None
+            logits = None
+            log_probs.append(log_prob)
         return torch.cat(log_probs, dim=0)
 
     def _backward_pass(self, loss: float) -> None:
@@ -2833,21 +2811,26 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                     break
 
     def _move_model_to_vllm(self) -> None:
-        """Move the deepspeed model to vllm."""
+        """Move the model weights to the colocated vLLM instance."""
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
-        model_ref = self.accelerator.unwrap_model(self.actor)
+            model_ref = self.accelerator.unwrap_model(self.actor)
+        elif isinstance(self.actor, DummyEvolvable):
+            model_ref = self.actor.module
+        else:
+            model_ref = self.actor
         model_ref.set_adapter("actor")
         with gather_if_zero3(self.zero_stage, list(model_ref.parameters())):
             model_ref.merge_adapter()
             for name, param in model_ref.named_parameters():
-                weight_name = name.removeprefix("base_model.model.").replace(
-                    ".base_layer",
-                    "",
+                weight_name = (
+                    name.removeprefix("module.")
+                    .removeprefix("base_model.model.")
+                    .replace(".base_layer", "")
                 )
                 # TRL value-head wrappers expose the underlying CausalLM as
                 # `pretrained_model.*`; vLLM expects raw model names.
-                weight_name = weight_name.removeprefix("pretrained_model.")
+                weight_name = weight_name.replace("pretrained_model.", "")
                 if model_ref.prefix in weight_name:
                     continue
 
@@ -2893,7 +2876,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         )
 
         max_output_tokens = [
-            min(max_token_cap, self.max_model_len - len(prompt_id))
+            min(max_token_cap, self.max_model_len - prompt_id.shape[-1])
             for prompt_id in prompts_ids
         ]
 
@@ -2908,11 +2891,6 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 0 if self.min_output_tokens is None else self.min_output_tokens
             ),
         }
-        sampling_params = [
-            SamplingParams(**generation_kwargs, max_tokens=max_output_token)
-            for max_output_token in max_output_tokens
-        ]
-
         if self.vllm_config.tensor_parallel_size > 1:
             orig_size = len(prompts_text)
 
@@ -2920,6 +2898,9 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 None for _ in range(self.vllm_config.tensor_parallel_size)
             ]
             gathered_prompts_text = [
+                None for _ in range(self.vllm_config.tensor_parallel_size)
+            ]
+            gathered_max_output_tokens = [
                 None for _ in range(self.vllm_config.tensor_parallel_size)
             ]
 
@@ -2933,6 +2914,11 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 prompts_text,
                 group=self.tp_group,
             )
+            torch.distributed.all_gather_object(
+                gathered_max_output_tokens,
+                max_output_tokens,
+                group=self.tp_group,
+            )
 
             all_prompts_ids = [
                 prompt_id for sublist in gathered_prompts_ids for prompt_id in sublist
@@ -2942,9 +2928,18 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 for sublist in gathered_prompts_text
                 for prompt_text in sublist
             ]
+            all_max_output_tokens = [
+                tok for sublist in gathered_max_output_tokens for tok in sublist
+            ]
         else:
             all_prompts_text = prompts_text
             all_prompts_ids = prompts_ids
+            all_max_output_tokens = max_output_tokens
+
+        sampling_params = [
+            SamplingParams(**generation_kwargs, max_tokens=max_output_token)
+            for max_output_token in all_max_output_tokens
+        ]
 
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
@@ -2953,7 +2948,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             all_prompts_text,
             sampling_params=sampling_params,
             use_tqdm=False,
-        )  # Change this to False
+        )
 
         completion_ids = [
             output.token_ids for outputs in all_outputs for output in outputs.outputs
@@ -2973,7 +2968,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             torch.cat(
                 [
                     torch.cat(
-                        prompts_ids[group_size * i : group_size * (i + 1)],
+                        [p.to(self.device) if self.accelerator is None else p for p in prompts_ids[group_size * i : group_size * (i + 1)] ],
                         dim=0,
                     ),
                     stack_and_pad_experiences(
@@ -2993,10 +2988,10 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         action_masks = []
 
         for i, completion_id in enumerate(completion_ids):
-            action_mask = torch.zeros_like(completion_id, device=self.device)
+            action_mask = torch.zeros_like(completion_id, dtype=torch.bool, device=self.device)
             action_mask[:, num_input_tokens[i] :] = True
             action_mask[completion_id == self.pad_token_id] = False
-            action_mask = action_mask[:, 1:] # FIXME removed this in ppo testing
+            action_mask = action_mask[:, 1:]
             action_masks.append(action_mask)
 
         return completion_ids, action_masks
@@ -3222,60 +3217,69 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 stacklevel=2,
             )
             self.vllm_config = VLLMConfig()
-        if self.accelerator is not None:
-            if (
-                self.accelerator.num_processes % self.vllm_config.tensor_parallel_size
-                != 0
-            ):
-                msg = f"Tensor parallel size {self.vllm_config.tensor_parallel_size} must be a multiple of the number of processes {self.accelerator.num_processes}."
-                raise ValueError(
-                    msg,
-                )
 
-            if self.vllm_config.tensor_parallel_size > 1:
-                # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
-                # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
-                self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
-                    [
-                        list(
-                            range(
-                                i * self.vllm_config.tensor_parallel_size,
-                                (i + 1) * self.vllm_config.tensor_parallel_size,
-                            ),
-                        )
-                        for i in range(
-                            self.accelerator.num_processes
-                            // self.vllm_config.tensor_parallel_size,
-                        )
-                    ],
-                )
+        if dist.is_initialized():
+            num_processes = dist.get_world_size()
+            rank = dist.get_rank()
+            local_rank = dist.get_rank()
+        else:
+            num_processes = 1
+            rank = 0
+            local_rank = 0
 
-            # vLLM requires the environment variables to be set for distributed training.
-            os.environ["RANK"] = str(self.accelerator.process_index)
-            os.environ["LOCAL_RANK"] = str(self.accelerator.local_process_index)
-            os.environ["WORLD_SIZE"] = str(self.accelerator.num_processes)
-            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
-            os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12345")
-
-            self.llm = LLM(
-                model=self.pretrained_model_name_or_path,
-                tensor_parallel_size=self.vllm_config.tensor_parallel_size,
-                gpu_memory_utilization=self.vllm_config.gpu_memory_utilization,
-                max_num_seqs=self.vllm_config.max_num_seqs,
-                max_model_len=self.max_model_len,
-                distributed_executor_backend="external_launcher",
-                seed=self.accelerator.process_index
-                // self.vllm_config.tensor_parallel_size,
-                max_num_batched_tokens=self.vllm_config.max_num_seqs
-                * self.max_model_len,
-                model_impl="vllm",
-                enable_sleep_mode=self.vllm_config.sleep_mode,
+        if (
+            num_processes % self.vllm_config.tensor_parallel_size
+            != 0
+        ):
+            msg = f"Tensor parallel size {self.vllm_config.tensor_parallel_size} must be a multiple of the number of processes {self.accelerator.num_processes}."
+            raise ValueError(
+                msg,
             )
-            if self.vllm_config.sleep_mode:
-                self.llm.sleep(level=2)
 
-        if self.accelerator is not None:
-            self.accelerator.wait_for_everyone()
+        if self.vllm_config.tensor_parallel_size > 1:
+            # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
+            # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
+            self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+                [
+                    list(
+                        range(
+                            i * self.vllm_config.tensor_parallel_size,
+                            (i + 1) * self.vllm_config.tensor_parallel_size,
+                        ),
+                    )
+                    for i in range(
+                        num_processes
+                        // self.vllm_config.tensor_parallel_size,
+                    )
+                ],
+            )
+
+        # vLLM requires the environment variables to be set for distributed training.
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ["WORLD_SIZE"] = str(num_processes)
+        os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12345")
+
+        self.llm = LLM(
+            model=self.pretrained_model_name_or_path,
+            tensor_parallel_size=self.vllm_config.tensor_parallel_size,
+            gpu_memory_utilization=self.vllm_config.gpu_memory_utilization,
+            max_num_seqs=self.vllm_config.max_num_seqs,
+            max_model_len=self.max_model_len,
+            distributed_executor_backend="external_launcher",
+            seed=rank
+            // self.vllm_config.tensor_parallel_size,
+            max_num_batched_tokens=self.vllm_config.max_num_seqs
+            * self.max_model_len,
+            model_impl="vllm",
+            enable_sleep_mode=self.vllm_config.sleep_mode,
+        )
+        if self.vllm_config.sleep_mode:
+            self.llm.sleep(level=2)
+
+        if dist.is_initialized():
+            dist.barrier()
 
     def _sync_deepspeed_gradient_clipping(self) -> None:
         """Synchronize max_grad_norm with DeepSpeed gradient_clipping config.

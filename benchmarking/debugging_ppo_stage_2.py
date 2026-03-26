@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import statistics
 from random import Random
-from types import MethodType
 
 from agilerl import HAS_LLM_DEPENDENCIES
 
@@ -17,11 +16,16 @@ import yaml
 from datasets import Dataset
 from peft import LoraConfig
 
-from agilerl.algorithms import LLMPPO
+USE_SEPARATE_CRITIC = True  # Set False to use ppo_llm_2.py (single actor with shared adapters)
+
+if USE_SEPARATE_CRITIC:
+    from agilerl.algorithms.ppo_llm import PPO as LLMPPO
+else:
+    from agilerl.algorithms.ppo_llm_2 import PPO as LLMPPO
 from agilerl.training import train_llm
 from agilerl.training.train_llm import finetune_llm_reasoning
 from agilerl.utils.llm_utils import ReasoningGym, masked_whiten
-from benchmarking.tiny_model import build_tiny_actor_network, TinyDigitTokenizer
+from benchmarking.tiny_model import build_tiny_actor_network, build_tiny_critic_network, TinyDigitTokenizer  # build_tiny_critic_network used only when USE_SEPARATE_CRITIC=True
 
 MAX_CONTEXT_LENGTH = 128
 MAX_OUTPUT_TOKENS = 1
@@ -31,9 +35,8 @@ TEST_POLICY_ONLY = False
 
 
 def target_from_question(question: str) -> str:
-    # Map 2-digit prompt to one of 3 target tokens in {1, 2, 3}.
-    total = sum(int(ch) for ch in question)
-    return str((total % 3) + 1)
+    # Single-digit prompt: "1"→"2", "2"→"3", "3"→"1".
+    return str(int(question) % 3 + 1)
 
 
 def make_dataset(
@@ -42,7 +45,7 @@ def make_dataset(
     seed: int = 42,
 ) -> tuple[Dataset, Dataset]:
     rng = Random(seed)
-    questions_space = [f"{a}{b}" for a in TARGET_TOKEN_IDS for b in TARGET_TOKEN_IDS]
+    questions_space = [str(t) for t in TARGET_TOKEN_IDS]
 
     def build_split(size: int) -> Dataset:
         # Balanced class coverage by cycling through all question patterns.
@@ -122,61 +125,15 @@ def enable_reinforce_style_advantages(agent: LLMPPO) -> None:
         # whiten masked rewards for REINFORCE-style advantages.
         returns = rewards
         advantages = masked_whiten(rewards, action_mask)
-        return returns, advantages
-
-    def _logprobs_no_critic(
-        self: LLMPPO,
-        ids: torch.Tensor,
-        batch_size: int,
-        use_reference: bool = False,
-        eval_mode: bool = False,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        with self.select_adapter("reference" if use_reference else "actor"):
-            self.actor.train(mode=not eval_mode)
-            if attention_mask is None:
-                attention_mask = ids != self.pad_token_id
-            if self.calc_position_embeddings:
-                position_ids = attention_mask.long().cumsum(dim=-1) - 1
-                position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
-
-            num_samples = ids.shape[0]
-            log_probs = []
-            for batch_start in range(0, num_samples, batch_size):
-                batch_end = min((batch_start + batch_size), num_samples)
-                batch_ids = ids[batch_start:batch_end, :]
-                batch_attention_mask = attention_mask[batch_start:batch_end, :]
-                model_kwargs = {
-                    "input_ids": batch_ids,
-                    "attention_mask": batch_attention_mask,
-                    "use_cache": False,
-                }
-                if self.calc_position_embeddings:
-                    model_kwargs["position_ids"] = position_ids[batch_start:batch_end, :]
-
-                # NOTE: use the underlying CausalLM directly to bypass value-head forward.
-                output = self.actor.pretrained_model.forward(**model_kwargs)
-                logits = output[0] if isinstance(output, tuple) else output.logits
-                log_prob = self._memory_efficient_logits(
-                    logits[:, :-1],
-                    batch_ids[:, 1:],
-                )
-                log_probs.append(log_prob)
-
-            full_log_probs = torch.cat(log_probs, dim=0)
-            zero_values = torch.zeros_like(full_log_probs)
-            return full_log_probs, zero_values, None
+        return returns, advantages * action_mask
 
     agent._compute_gae_returns = _reinforce_like_returns  # type: ignore[method-assign]
-    agent._get_logprobs_and_values = MethodType(  # type: ignore[method-assign]
-        _logprobs_no_critic,
-        agent,
-    )
 
 
 def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
     torch.manual_seed(seed)
     actor_network = build_tiny_actor_network()
+    critic_network = build_tiny_critic_network() if USE_SEPARATE_CRITIC else None
     tokenizer = TinyDigitTokenizer()
     train_dataset, test_dataset = make_dataset(seed=seed)
 
@@ -199,15 +156,17 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
         seed=seed,
     )
 
+
+
     llm_ppo = LLMPPO(
         model_name=None,
         actor_network=actor_network,
+        **({"critic_network": critic_network} if USE_SEPARATE_CRITIC else {}),
         lora_config=LoraConfig(
-            r=32,
-            lora_alpha=16,
+            r=8,
+            lora_alpha=32,
             target_modules=["c_attn", "c_proj", "c_fc"],
             bias="none",
-            modules_to_save=["summary"],
             task_type="CAUSAL_LM",
         ),
         micro_batch_size_per_gpu=min(8, init_hp["BATCH_SIZE"]),
@@ -228,6 +187,7 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
         vf_coef=init_hp["VF_COEF"],
         gamma=init_hp["GAMMA"],
         gae_lambda=init_hp["GAE_LAMBDA"],
+        calc_position_embeddings=False,
         seed=seed,
     )
     if TEST_POLICY_ONLY:
@@ -315,12 +275,12 @@ if __name__ == "__main__":
 
     init_hp = config["INIT_HP"]
     # Stage-2 smoke-test overrides.
-    init_hp["BATCH_SIZE"] = 32
-    init_hp["UPDATE_EPOCHS"] = 4
-    init_hp["LR"] = 5e-4
-    init_hp["BETA"] = 0.001
-    init_hp["TEMPERATURE"] = 0.8
+    init_hp["BATCH_SIZE"] = 64
+    init_hp["UPDATE_EPOCHS"] = 2
+    init_hp["LR"] = 1e-4
+    init_hp["BETA"] = 0.01
+    init_hp["TEMPERATURE"] = 0.4
     init_hp["VF_COEF"] = 0.0 if TEST_POLICY_ONLY else 0.5
     init_hp["GAMMA"] = 1.0
-    init_hp["GAE_LAMBDA"] = 1.0
+    init_hp["GAE_LAMBDA"] = 1.0 
     main(init_hp)
