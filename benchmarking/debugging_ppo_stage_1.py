@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import statistics
 from random import Random
-from types import MethodType
 
 from agilerl import HAS_LLM_DEPENDENCIES
 
@@ -26,7 +25,6 @@ else:
     from agilerl.algorithms.ppo_llm_2 import PPO as LLMPPO
 from agilerl.training import train_llm
 from agilerl.training.train_llm import finetune_llm_reasoning
-from agilerl.utils.algo_utils import stack_and_pad_experiences
 from agilerl.utils.llm_utils import ReasoningGym, masked_whiten
 from benchmarking.tiny_model import build_tiny_actor_network, build_tiny_critic_network, TinyDigitTokenizer  # build_tiny_critic_network used only when USE_SEPARATE_CRITIC=True
 
@@ -35,12 +33,11 @@ MAX_OUTPUT_TOKENS = 1
 EVAL_BATCHES = 8
 TARGET_TOKEN_IDS = (1, 2, 3)
 TEST_POLICY_ONLY = False
-USE_ACCELERATOR = False
+
 
 def target_from_question(question: str) -> str:
-    # Map 2-digit prompt to one of 3 target tokens in {1, 2, 3}.
-    total = sum(int(ch) for ch in question)
-    return str((total % 3) + 1)
+    # Single-digit prompt: "1"→"2", "2"→"3", "3"→"1".
+    return str(int(question) % 3 + 1)
 
 
 def make_dataset(
@@ -49,7 +46,7 @@ def make_dataset(
     seed: int = 42,
 ) -> tuple[Dataset, Dataset]:
     rng = Random(seed)
-    questions_space = [f"{a}{b}" for a in TARGET_TOKEN_IDS for b in TARGET_TOKEN_IDS]
+    questions_space = [str(t) for t in TARGET_TOKEN_IDS]
 
     def build_split(size: int) -> Dataset:
         # Balanced class coverage by cycling through all question patterns.
@@ -71,11 +68,12 @@ def evaluate_accuracy(
     env: ReasoningGym,
     batches: int = EVAL_BATCHES,
     greedy_like: bool = False,
-) -> tuple[float, dict[int, float], float]:
+) -> tuple[float, dict[int, float]]:
     original_temperature = agent.generation_config.temperature
     original_top_k = agent.generation_config.top_k
     original_top_p = agent.generation_config.top_p
     if greedy_like:
+        # PPO generation path uses sampling; make it near-greedy for evaluation only.
         agent.generation_config.temperature = 1e-3
         agent.generation_config.top_k = 1
         agent.generation_config.top_p = 1.0
@@ -84,14 +82,12 @@ def evaluate_accuracy(
     correct = 0
     class_total = {target: 0 for target in TARGET_TOKEN_IDS}
     class_correct = {target: 0 for target in TARGET_TOKEN_IDS}
-    all_sq_errors = []
     try:
-        with env.eval_mode(), torch.no_grad():
+        with env.eval_mode():
             prompts = env.reset(reset_dataloaders=True)
             for _ in range(batches):
-                answers = [int(answer) for answer in env.answers]
-                completion_ids, action_masks = agent.get_action(prompts, training=False)
-                seq_rewards = []
+                answers = [int(ans) for ans in env.answers]
+                completion_ids, _ = agent.get_action(prompts, training=False)
                 for prompt, group_completion, answer in zip(
                     prompts,
                     completion_ids,
@@ -106,34 +102,6 @@ def evaluate_accuracy(
                     correct += batch_correct
                     class_total[answer] += batch_total
                     class_correct[answer] += batch_correct
-                    reward = 1.0 if preds.item() == answer else -1.0
-                    seq_rewards.append(reward)
-
-                padded_ids, padded_masks = stack_and_pad_experiences(
-                    completion_ids,
-                    action_masks,
-                    padding_values=[agent.pad_token_id, False],
-                )
-                padded_ids = padded_ids.to(agent.device)
-                padded_masks = padded_masks.to(agent.device)
-                if not USE_SEPARATE_CRITIC:
-                    with agent.select_adapter("critic"):
-                        values = agent._get_values(
-                            padded_ids,
-                            batch_size=padded_ids.shape[0],
-                            eval_mode=True,
-                        )
-                else:
-                    values = agent._get_values(
-                        padded_ids,
-                        batch_size=padded_ids.shape[0],
-                        eval_mode=True,
-                    )
-                last_action_idx = padded_masks.long().cumsum(dim=-1).argmax(dim=-1)
-                last_values = values.gather(1, last_action_idx.unsqueeze(1)).squeeze(1)
-                rewards_t = torch.tensor(seq_rewards, device=last_values.device)
-                all_sq_errors.append((last_values - rewards_t).pow(2).mean().item())
-
                 prompts, _ = env.step(completion_ids)
     finally:
         agent.generation_config.temperature = original_temperature
@@ -144,8 +112,7 @@ def evaluate_accuracy(
         target: class_correct[target] / max(class_total[target], 1)
         for target in TARGET_TOKEN_IDS
     }
-    critic_mse = sum(all_sq_errors) / max(len(all_sq_errors), 1)
-    return correct / max(total, 1), per_class, critic_mse
+    return correct / max(total, 1), per_class
 
 
 def enable_reinforce_style_advantages(agent: LLMPPO) -> None:
@@ -159,63 +126,13 @@ def enable_reinforce_style_advantages(agent: LLMPPO) -> None:
         # whiten masked rewards for REINFORCE-style advantages.
         returns = rewards
         advantages = masked_whiten(rewards, action_mask)
-        return returns, advantages
-
-    def _logprobs_no_critic(
-        self: LLMPPO,
-        ids: torch.Tensor,
-        batch_size: int,
-        use_reference: bool = False,
-        eval_mode: bool = False,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        with self.select_adapter("reference" if use_reference else "actor"):
-            self.actor.train(mode=not eval_mode)
-            if attention_mask is None:
-                attention_mask = ids != self.pad_token_id
-            if self.calc_position_embeddings:
-                position_ids = attention_mask.long().cumsum(dim=-1) - 1
-                position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
-
-            num_samples = ids.shape[0]
-            log_probs = []
-            for batch_start in range(0, num_samples, batch_size):
-                batch_end = min((batch_start + batch_size), num_samples)
-                batch_ids = ids[batch_start:batch_end, :]
-                batch_attention_mask = attention_mask[batch_start:batch_end, :]
-                model_kwargs = {
-                    "input_ids": batch_ids,
-                    "attention_mask": batch_attention_mask,
-                    "use_cache": False,
-                }
-                if self.calc_position_embeddings:
-                    model_kwargs["position_ids"] = position_ids[
-                        batch_start:batch_end, :
-                    ]
-
-                # NOTE: use the underlying CausalLM directly to bypass value-head forward.
-                output = self.actor.pretrained_model.forward(**model_kwargs)
-                logits = output[0] if isinstance(output, tuple) else output.logits
-                log_prob = self._memory_efficient_logits(
-                    logits[:, :-1],
-                    batch_ids[:, 1:],
-                )
-                log_probs.append(log_prob)
-
-            full_log_probs = torch.cat(log_probs, dim=0)
-            zero_values = torch.zeros_like(full_log_probs)
-            return full_log_probs, zero_values, None
+        return returns, advantages * action_mask
 
     agent._compute_gae_returns = _reinforce_like_returns  # type: ignore[method-assign]
-    if not USE_SEPARATE_CRITIC:
-        agent._get_logprobs_and_values = MethodType(  # type: ignore[method-assign]
-            _logprobs_no_critic,
-            agent,
-        )
 
 
 def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
-    accelerator = Accelerator() if USE_ACCELERATOR else None
+    accelerator = Accelerator()
     torch.manual_seed(seed)
     actor_network = build_tiny_actor_network()
     critic_network = build_tiny_critic_network() if USE_SEPARATE_CRITIC else None
@@ -240,6 +157,8 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
         return_raw_completions=False,
         seed=seed,
     )
+
+
 
     llm_ppo = LLMPPO(
         model_name=None,
@@ -279,19 +198,14 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
     else:
         print(f"[seed={seed}] mode: test_policy_only=False (PPO GAE advantages)")
 
-    pre_acc, pre_class, pre_mse = evaluate_accuracy(llm_ppo, env, greedy_like=False)
-    pre_acc_g, pre_class_g, pre_mse_g = evaluate_accuracy(
-        llm_ppo, env, greedy_like=True
-    )
+    pre_acc, pre_class = evaluate_accuracy(llm_ppo, env, greedy_like=False)
+    pre_acc_g, pre_class_g = evaluate_accuracy(llm_ppo, env, greedy_like=True)
     print(
         f"[seed={seed}] pre-train acc (sampled/greedy-like): "
         f"{pre_acc:.3f}/{pre_acc_g:.3f}"
     )
     print(f"[seed={seed}] pre per-class sampled: {pre_class}")
     print(f"[seed={seed}] pre per-class greedy-like: {pre_class_g}")
-    print(
-        f"[seed={seed}] pre critic MSE (sampled/greedy-like): {pre_mse:.4f}/{pre_mse_g:.4f}"
-    )
 
     original_save_checkpoint = train_llm.save_llm_checkpoint
     train_llm.save_llm_checkpoint = lambda *args, **kwargs: None
@@ -311,15 +225,13 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
             accelerator=accelerator,
             checkpoint_steps=999999,
             verbose=True,
-            max_steps=4096 * 3,
+            max_steps=4096,
         )
     finally:
         train_llm.save_llm_checkpoint = original_save_checkpoint
 
-    post_acc, post_class, post_mse = evaluate_accuracy(llm_ppo, env, greedy_like=False)
-    post_acc_g, post_class_g, post_mse_g = evaluate_accuracy(
-        llm_ppo, env, greedy_like=True
-    )
+    post_acc, post_class = evaluate_accuracy(llm_ppo, env, greedy_like=False)
+    post_acc_g, post_class_g = evaluate_accuracy(llm_ppo, env, greedy_like=True)
     print(
         f"[seed={seed}] post-train acc (sampled/greedy-like): "
         f"{post_acc:.3f}/{post_acc_g:.3f}"
@@ -327,15 +239,8 @@ def run_single_seed(init_hp: dict, seed: int) -> tuple[float, float]:
     print(f"[seed={seed}] post per-class sampled: {post_class}")
     print(f"[seed={seed}] post per-class greedy-like: {post_class_g}")
     print(
-        f"[seed={seed}] post critic MSE (sampled/greedy-like): {post_mse:.4f}/{post_mse_g:.4f}"
-    )
-    print(
         f"[seed={seed}] improvement (sampled/greedy-like): "
         f"{post_acc - pre_acc:+.3f}/{post_acc_g - pre_acc_g:+.3f}"
-    )
-    print(
-        f"[seed={seed}] critic MSE change (sampled/greedy-like): "
-        f"{post_mse - pre_mse:+.4f}/{post_mse_g - pre_mse_g:+.4f}"
     )
     return post_acc - pre_acc, post_acc_g - pre_acc_g
 
@@ -372,12 +277,12 @@ if __name__ == "__main__":
 
     init_hp = config["INIT_HP"]
     # Stage-2 smoke-test overrides.
-    init_hp["BATCH_SIZE"] = 32
-    init_hp["UPDATE_EPOCHS"] = 4
-    init_hp["LR"] = 1e-5
-    init_hp["BETA"] = 0.05
+    init_hp["BATCH_SIZE"] = 64
+    init_hp["UPDATE_EPOCHS"] = 2
+    init_hp["LR"] = 1e-4
+    init_hp["BETA"] = 0.01
     init_hp["TEMPERATURE"] = 0.4
-    init_hp["VF_COEF"] = 0.1
+    init_hp["VF_COEF"] = 0.0 if TEST_POLICY_ONLY else 0.5
     init_hp["GAMMA"] = 1.0
-    init_hp["GAE_LAMBDA"] = 0.95
-    main(init_hp, (0,))
+    init_hp["GAE_LAMBDA"] = 1.0 
+    main(init_hp)

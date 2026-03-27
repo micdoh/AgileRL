@@ -82,7 +82,7 @@ class PPO(LLMAlgorithm):
         use_vllm: bool = False,
         vllm_config: VLLMConfig | None = None,
         seed: int = 42,
-        gradient_checkpointing: bool = True,
+        gradient_checkpointing: bool = False,
     ) -> None:
 
         device = (
@@ -169,6 +169,7 @@ class PPO(LLMAlgorithm):
 
         self.use_vllm = use_vllm
         self.vllm_config = vllm_config
+        self.learn_step_counter = 0
         if self.use_vllm:
             self._configure_vllm()
         self._initialize_actors(actor_network, not clone)
@@ -185,6 +186,7 @@ class PPO(LLMAlgorithm):
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Return generated completion ids and corresponding action masks."""
         self.actor.eval()
+        self.actor.set_adapter("actor")
         if not self.use_vllm:
             actor_module = self._get_unwrapped_actor()
             try:
@@ -259,6 +261,23 @@ class PPO(LLMAlgorithm):
             self.optimizer.zero_grad()
         else:
             loss.backward()
+            if self.learn_step_counter % 16 == 0:
+                actor_gnorm = torch.sqrt(sum(
+                    p.grad.norm() ** 2 for n, p in self.actor.named_parameters()
+                    if p.grad is not None and "actor" in n and "lora" in n
+                )).item()
+                critic_gnorm = torch.sqrt(sum(
+                    p.grad.norm() ** 2 for n, p in self.actor.named_parameters()
+                    if p.grad is not None and "critic" in n and "lora" in n
+                )).item()
+                n_actor_grad = sum(1 for n, p in self.actor.named_parameters() if p.grad is not None and "actor" in n and "lora" in n)
+                n_critic_grad = sum(1 for n, p in self.actor.named_parameters() if p.grad is not None and "critic" in n and "lora" in n)
+                print(
+                    f"  [grad step={self.learn_step_counter}] "
+                    f"actor_gnorm={actor_gnorm:.6f} ({n_actor_grad} params) "
+                    f"critic_gnorm={critic_gnorm:.6f} ({n_critic_grad} params)"
+                )
+            self.learn_step_counter += 1
             all_lora_params = [
                 p for group in self.optimizer.optimizer.param_groups
                 for p in group["params"]
@@ -327,7 +346,6 @@ class PPO(LLMAlgorithm):
                     eval_mode=True,
                 )
             old_values = torch.masked_fill(old_values, ~action_masks.bool(), 0.0)
-
             token_rewards = self._compute_token_rewards(action_masks, sequence_rewards)
             old_log_probs = torch.masked_fill(old_log_probs, ~action_masks.bool(), 1.0)
             reference_log_probs = torch.masked_fill(reference_log_probs, ~action_masks.bool(), 1.0)
@@ -400,6 +418,25 @@ class PPO(LLMAlgorithm):
                 vf_loss = 0.5 * masked_mean(torch.max(vf_loss, clipped_vf_loss), batch_action_mask) * self.vf_coef
 
                 total_loss = pg_loss + vf_loss
+
+                # --- Diagnostic logging (pre-backward, no gradient info) ---
+                if updates % 16 == 0:
+                    adv_mean = batch_advantages[batch_action_mask.bool()].mean().item()
+                    adv_std = batch_advantages[batch_action_mask.bool()].std().item()
+                    val_mean = batch_values[batch_action_mask.bool()].mean().item()
+                    val_std = batch_values[batch_action_mask.bool()].std().item()
+                    ret_mean = batch_returns[batch_action_mask.bool()].mean().item()
+                    ratio_mean = policy_ratio[batch_action_mask.bool()].mean().item()
+                    ratio_max = policy_ratio[batch_action_mask.bool()].max().item()
+                    print(
+                        f"  [diag step={updates}] "
+                        f"pg={pg_loss.item():.4f} vf={vf_loss.item():.4f} "
+                        f"adv={adv_mean:+.4f}±{adv_std:.4f} "
+                        f"val={val_mean:+.4f}±{val_std:.4f} "
+                        f"ret={ret_mean:+.4f} "
+                        f"ratio={ratio_mean:.3f}(max={ratio_max:.3f})"
+                    )
+
                 self._backward_pass(total_loss)
 
                 mean_kl += masked_mean(kl, batch_action_mask).item()

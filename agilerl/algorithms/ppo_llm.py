@@ -335,6 +335,7 @@ class PPO(LLMAlgorithm):
             # Critic is prepared separately for device placement; its LoRA params
             # are already registered in the shared optimizer wrapped by super().
             self.critic = self.accelerator.prepare(self.critic)
+            print("Wrapped critic", self.critic)
             if self.gradient_checkpointing:
                 self.critic.module.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False}
