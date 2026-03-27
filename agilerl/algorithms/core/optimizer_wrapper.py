@@ -58,34 +58,46 @@ def init_from_single(
     optimizer_kwargs: dict[str, Any],
 ) -> Optimizer:
     """Initialize an optimizer from a single network."""
-    # FIXME test for
-    # params = [
-    #     {"params": [param for name, param in network.named_parameters() if "actor" in name and "lora" in name], "lr": lr},
-    #     {"params":  [
-    #     param for name, param in network.named_parameters()
-    #     if "v_head" in name and "modules_to_save.actor" in name
-    # ], "lr": 0.00001},
-    # ]
-    # print("PARAMS", params)
-    # print("NETWORK", network)
-    # return optimizer_cls(params, **optimizer_kwargs)
+    return optimizer_cls(network.parameters(), lr=lr, **optimizer_kwargs)
 
-    for name, param in network.named_parameters():
-        if "critic" in name or "actor" in name:
-            param.requires_grad = True
 
+def init_from_peft(
+    network: PeftModelType,
+    optimizer_cls: OptimizerType,
+    actor_lr: float,
+    optimizer_kwargs: dict[str, Any],
+    critic_lr: float | None = None,
+) -> Optimizer:
+    """Initialize an optimizer from a PEFT model with separate param groups
+    for actor and critic LoRA adapters.
+
+    :param network: The PEFT model (or DummyEvolvable wrapping one) to be optimized.
+    :type network: PeftModelType
+    :param optimizer_cls: The optimizer class to be initialized.
+    :type optimizer_cls: OptimizerType
+    :param actor_lr: The learning rate for the actor adapter parameters.
+    :type actor_lr: float
+    :param optimizer_kwargs: The keyword arguments to be passed to the optimizer.
+    :type optimizer_kwargs: dict[str, Any]
+    :param critic_lr: The learning rate for the critic adapter parameters.
+        If None, only actor parameters are included.
+    :type critic_lr: float | None
+    """
     actor_params = [
-        p for n, p in network.named_parameters() if "actor" in n and p.requires_grad
+        p for n, p in network.named_parameters()
+        if "actor" in n and "lora" in n and p.requires_grad
     ]
-    critic_params = [
-        p for n, p in network.named_parameters() if "critic" in n and p.requires_grad
-    ]
-    params = [
-        {"params": actor_params, "lr": lr},
-        {"params": critic_params, "lr": lr},
-    ]
-    return optimizer_cls(params, **optimizer_kwargs)
+    param_groups = [{"params": actor_params, "lr": actor_lr}]
 
+    if critic_lr is not None:
+        critic_params = [
+            p for n, p in network.named_parameters()
+            if "critic" in n and "lora" in n and p.requires_grad
+        ]
+        if critic_params:
+            param_groups.append({"params": critic_params, "lr": critic_lr})
+
+    return optimizer_cls(param_groups, **optimizer_kwargs)
 
 class OptimizerWrapper:
     """Wrapper to initialize optimizer and store metadata relevant for
@@ -118,11 +130,13 @@ class OptimizerWrapper:
         optimizer_kwargs: dict[str, Any] | None = None,
         network_names: list[str] | None = None,
         lr_name: str | None = None,
+        critic_lr: float | None = None,
     ) -> None:
 
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = optimizer_kwargs if optimizer_kwargs is not None else {}
         self.lr = lr
+        self.critic_lr = critic_lr
 
         if isinstance(networks, nn.Module):
             self.networks = [networks]
@@ -186,6 +200,15 @@ class OptimizerWrapper:
                 optimizer_cls,
                 self.lr,
                 self.optimizer_kwargs,
+            )
+
+        elif self.critic_lr is not None:
+            self.optimizer = init_from_peft(
+                self.networks[0],
+                optimizer_cls,
+                self.lr,
+                self.optimizer_kwargs,
+                critic_lr=self.critic_lr,
             )
 
         # Single-agent algorithms with a single network for a single optimizer

@@ -95,7 +95,8 @@ class PPO(LLMAlgorithm):
         clip_coef: float = 0.2,
         gamma: float = 1.0,
         gae_lambda: float = 1.0,
-        lr: float = 5e-7,
+        lr: float = 5e-6,
+        critic_lr: float = 5e-4,
         max_grad_norm: float = 1.0,
         update_epochs: int = 1,
         temperature: float = 1.0,
@@ -131,6 +132,7 @@ class PPO(LLMAlgorithm):
             index=index,
             batch_size=batch_size,
             lr=lr,
+            critic_lr=critic_lr,
             max_grad_norm=max_grad_norm,
             clone=clone,
             reduce_memory_peak=reduce_memory_peak,
@@ -484,15 +486,7 @@ class PPO(LLMAlgorithm):
         action_mask: torch.Tensor,
         sequence_rewards: torch.Tensor,
     ) -> torch.Tensor:
-        token_rewards = torch.zeros_like(action_mask, dtype=torch.float32)
-        valid = action_mask.any(dim=-1)
-        if valid.any():
-            reward_idx = action_mask[valid].long().cumsum(dim=-1).argmax(dim=-1)
-            row_ids = torch.arange(
-                token_rewards.shape[0],
-                device=token_rewards.device,
-            )[valid]
-            token_rewards[row_ids, reward_idx] = sequence_rewards[valid]
+        token_rewards = action_mask.float() * sequence_rewards.unsqueeze(1)
         return token_rewards
 
     def _get_values(

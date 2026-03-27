@@ -19,7 +19,6 @@ from agilerl.algorithms import LLMPPO
 from agilerl.training.train_llm import finetune_llm_reasoning
 from agilerl.utils.llm_utils import ReasoningGym
 from agilerl.utils.algo_utils import VLLMConfig
-from agilerl.utils.utils import create_population
 
 MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 DATASET = "Jiayi-Pan/Countdown-Tasks-3to4"
@@ -40,65 +39,71 @@ def make_dataset(dataset_name: str) -> tuple[Dataset, Dataset]:
     return train_dataset, test_dataset
 
 
-def format_reward_func(completions, target, **kwargs):
-    rewards = []
-    for completion, _gt in zip(completions, target, strict=False):
-        try:
-            # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
-            completion = "<think>" + completion
-            regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
-            matches = re.search(regex, completion, re.DOTALL)
-            if matches is None or len(matches.groups()) != 2:
-                rewards.append(0.0)
-            else:
-                rewards.append(1.0)
-        except Exception:  # noqa: PERF203
-            rewards.append(0.0)
-    return rewards
+def reward_fn(completion, answer, question):
+    """Reward for adding numbers together with <reasoning>/<answer> format.
 
+    The 'answer' field from the dataset is ignored -- the correct answer is
+    simply sum(question).
 
-def equation_reward_func(completions, target, nums, **kwargs):
-    rewards = []
+    Format (0.1 each, 0.5 total):
+      1. Contains <reasoning> opening tag
+      2. Contains </reasoning> closing tag
+      3. Contains <answer> opening tag
+      4. Contains </answer> closing tag
+      5. Correct ordering (reasoning closes before answer opens)
 
-    for completion, gt, numbers in zip(completions, target, nums, strict=False):
-        try:
-            # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
-            completion = "<think>" + completion
-            answer_tags = re.findall(r"<answer>([\s\S]*?)<\/answer>", completion)
+    Correctness (0.5):
+      The number inside <answer>...</answer> equals sum(question)
 
-            if len(answer_tags) != 1:
-                rewards.append(0.0)
-                continue
+    Perfect format bonus (0.5):
+      Full response matches <reasoning>...</reasoning>\n<answer>...</answer>
+      with non-empty content in both sections.
+    """
+    target = sum(question)
+    reward = 0.0
 
-            equation = answer_tags[0].strip()
-            used_numbers = [int(n) for n in re.findall(r"\d+", equation)]
+    has_reason_open = "<reasoning>" in completion
+    has_reason_close = "</reasoning>" in completion
+    has_answer_open = "<answer>" in completion
+    has_answer_close = "</answer>" in completion
 
-            if sorted(used_numbers) != sorted(numbers):
-                rewards.append(0.0)
-                continue
+    if has_reason_open:
+        reward += 0.1
+    if has_reason_close:
+        reward += 0.1
+    if has_answer_open:
+        reward += 0.1
+    if has_answer_close:
+        reward += 0.1
 
-            allowed_pattern = r"^[\d+\-*/().\s]+$"
-            if not re.match(allowed_pattern, equation):
-                rewards.append(0.0)
-                continue
+    if has_reason_open and has_reason_close and has_answer_open and has_answer_close:
+        reason_close_idx = completion.index("</reasoning>")
+        answer_open_idx = completion.index("<answer>")
+        if reason_close_idx < answer_open_idx:
+            reward += 0.1
 
-            result = eval(equation, {"__builtins__": None}, {})
+            answer_content = completion[
+                completion.index("<answer>") + len("<answer>"):
+                completion.index("</answer>")
+            ].strip()
+            numbers = re.findall(r"-?\d+", answer_content)
+            if numbers and int(numbers[-1]) == target:
+                reward += 0.5
 
-            if abs(float(result) - float(gt)) < 1e-5:
-                rewards.append(1.0)
-            else:
-                rewards.append(0.0)
-        except Exception:
-            rewards.append(0.0)
-    return rewards
+            reasoning_content = completion[
+                completion.index("<reasoning>") + len("<reasoning>"):
+                reason_close_idx
+            ].strip()
+            if reasoning_content and answer_content:
+                match = re.match(
+                    r"^\s*<reasoning>.+</reasoning>\s*<answer>.+</answer>\s*$",
+                    completion,
+                    re.DOTALL,
+                )
+                if match:
+                    reward += 0.5
 
-
-def combined_rewards(completion, solution, prompt):
-
-    return (
-        equation_reward_func([completion], [solution], [prompt])[0]
-        + format_reward_func([completion], [solution])[0]
-    )
+    return reward
 
 
 def main(init_hp, mut_p):
@@ -124,42 +129,35 @@ def main(init_hp, mut_p):
             "gate_proj",
         ]
 
-    # tokenizer.pad_token = tokenizer.eos_token
     print("Tokenizer", tokenizer.pad_token, tokenizer.eos_token)
     train_dataset, test_dataset = make_dataset(DATASET)
 
-    # Define a conversation template for the reasoning task, refer to questions and answers as q and a respectively
     conversation_template = [
         {
             "role": "system",
-            "content": "You are a helpful assistant. You first think about the reasoning process in your mind and then provide the user with the answer.",
+            "content": "You are a helpful assistant. Show your reasoning in <reasoning> </reasoning> tags, then give your final answer in <answer> </answer> tags.",
         },
         {
             "role": "user",
-            "content": "Using each number in this list only once {question}, create an equation that equals {answer}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer>(1 + 2) / 3</answer>.",
+            "content": "What is the sum of the following numbers: {question}?",
         },
-        {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
+        {"role": "assistant", "content": ""},
     ]
 
-    # Convert the HuggingFace dataset into a Gymnasium environment
     accelerator = Accelerator() if not USE_TINY_DEBUG_MODEL else None
     env = ReasoningGym(
         train_dataset=train_dataset,
         test_dataset=test_dataset,
         tokenizer=tokenizer,
-        reward_fn=combined_rewards,
+        reward_fn=reward_fn,
         conversation_template=conversation_template,
-        data_batch_size_per_gpu=init_hp["BATCH_SIZE"],  # FIXME this needs fixing
+        data_batch_size_per_gpu=init_hp["BATCH_SIZE"],
         accelerator=accelerator,
         max_context_length=MAX_CONTEXT_LENGTH,
         return_raw_completions=USE_VLLM,
     )
 
-    # Add the zero stage to the initialization hyperparameters
     init_hp["ALGO"] = "LLMPPO"
-    # init_hp["ZERO_STAGE"] = accelerator.state.deepspeed_plugin.deepspeed_config[
-    #     "zero_optimization"
-    # ]["stage"]
     init_hp["MAX_MODEL_LEN"] = MAX_CONTEXT_LENGTH
     print("pad token id", tokenizer.pad_token_id)
     assert tokenizer.pad_token_id != tokenizer.eos_token_id, (
@@ -174,7 +172,6 @@ def main(init_hp, mut_p):
             lora_alpha=64,
             target_modules=target_modules,
             bias="none",
-            # modules_to_save=["summary"],
             task_type="CAUSAL_LM",
         ),
         micro_batch_size_per_gpu=8
@@ -187,7 +184,6 @@ def main(init_hp, mut_p):
         batch_size=init_hp["BATCH_SIZE"],
         beta=init_hp["BETA"],
         lr=init_hp["LR"],
-        critic_lr=init_hp["CRITIC_LR"],
         clip_coef=init_hp["CLIP_COEF"],
         max_grad_norm=init_hp["MAX_GRAD_NORM"],
         update_epochs=init_hp["UPDATE_EPOCHS"],
@@ -207,30 +203,6 @@ def main(init_hp, mut_p):
 
     print("llm_ppo.lr", llm_ppo.lr)
 
-    algo_kwargs = {
-        "model_name": MODEL_PATH,
-        "lora_config": LoraConfig(
-            r=16,
-            lora_alpha=64,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            lora_dropout=0.05,
-            bias="none",
-        ),
-        "use_vllm": USE_VLLM,
-        "pad_token_id": tokenizer.pad_token_id,
-        "pad_token": tokenizer.pad_token,
-    }
-
-    # pop = create_population(
-    #     algo=init_hp["ALGO"],
-    #     net_config=None,
-    #     INIT_HP=init_hp,
-    #     hp_config=None,
-    #     population_size=init_hp["POP_SIZE"],
-    #     accelerator=accelerator,
-    #     algo_kwargs=algo_kwargs,
-    # )
-
     finetune_llm_reasoning(
         pop=[llm_ppo],
         env=env,
@@ -239,7 +211,7 @@ def main(init_hp, mut_p):
         wb=True,
         save_elite=True,
         elite_path="saved_llms",
-        max_reward=2.0,
+        max_reward=1.5,
         evo_steps=None,
         mutation=None,
         tournament=None,

@@ -153,6 +153,7 @@ class GRPO(LLMAlgorithm):
             index=index,
             batch_size=batch_size,
             lr=lr,
+            critic_lr=None,
             max_grad_norm=max_grad_norm,
             clone=clone,
             reduce_memory_peak=reduce_memory_peak,

@@ -32,6 +32,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import SequentialLR
 from typing_extensions import Self
+import dataclasses
 
 from agilerl import HAS_LLM_DEPENDENCIES
 from agilerl.algorithms.core.optimizer_wrapper import OptimizerWrapper
@@ -1940,6 +1941,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         index: int,
         batch_size: int,
         lr: float,
+        critic_lr,
         max_grad_norm: float,
         clone: bool,
         reduce_memory_peak: bool,
@@ -2062,6 +2064,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
             lora_config.exclude_modules = ["lm_head"]
         self.lr = lr
+        self.critic_lr = critic_lr
         self.lora_config = lora_config
         self.wrap = wrap
         self.use_separate_reference_adapter = use_separate_reference_adapter
@@ -2591,6 +2594,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                     optim_class,
                     networks=[self.actor],
                     lr=self.lr,
+                    critic_lr=self.lr if self.use_value_head else None,
                 )
                 self.wrap_models()
             self.reference_update_tracker += 1
@@ -2636,8 +2640,6 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
 
         if self.use_value_head and add_adapters:
-            import dataclasses
-
             config = dataclasses.replace(self.lora_config)
             config.target_modules.add("summary")
             self.actor.add_adapter(
@@ -2648,10 +2650,6 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         self.use_adapter("actor")
         patch_lora_for_fused_forward(self.actor)
 
-        for name, param in self.actor.named_parameters():
-            if "actor" in name and "lora" in name:
-                assert param.requires_grad is True
-
         if self.accelerator is None:
             self.actor = DummyEvolvable(module=self.actor, device=self.device)
 
@@ -2660,6 +2658,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             optim_class,
             networks=[self.actor],
             lr=self.lr,
+            critic_lr=self.critic_lr,
         )
 
         self.lr_scheduler = (
@@ -2721,7 +2720,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
 
             output = self.actor.forward(**model_kwargs)
             logits = output[0] if isinstance(output, tuple) else output.logits
-            logits = logits / self.temperature
+            logits /= self.temperature
             value = output[-1] if isinstance(output, tuple) else output[2]
 
             all_logprobs.append(
@@ -3111,11 +3110,12 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
 
+
         all_outputs = self.llm.generate(
             all_prompts_text,
             sampling_params=sampling_params,
             use_tqdm=False,
-        )  # Change this to False
+        )  
 
         completion_ids = [
             output.token_ids for outputs in all_outputs for output in outputs.outputs
